@@ -18,7 +18,7 @@ We trained an TD3 RL neural network agent to drive the car. We trained it in suc
 3. Fine-tune to teach it speed control (full speed unlocked).
 4. Fine-tune to learn again how to finish the whole circuit.
 
-The inference script also has a deterministic safeguard system. If the car leaves the road or TD3 stops providing steering data, a deterministic steering algorithm takes control until the car is on the road again and TD3 resumes it.
+In the inference script, we decided to add a safety envelope for the AI system in form of a deterministic fallback. If the neural network stopped responding or the car fell off the track, the deterministic program takes control until the AI can drive again.
 
 ---
 
