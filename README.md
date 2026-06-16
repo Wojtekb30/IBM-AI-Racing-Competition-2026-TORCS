@@ -10,7 +10,7 @@ Our team: WIPy_z_Polsl
 
 People:
 - Wojciech B
-- P
+- Patryk N
 
 We trained an TD3 RL neural network agent to drive the car. We trained it in such order:
 1. Pre-train to finish the Corkscrew circuit (max speed locked to ~85).
