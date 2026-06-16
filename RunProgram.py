@@ -14,6 +14,9 @@ SOCKET_TIMEOUT_SEC = 1.0
 TRACK_ANGLES = "-45 -19 -12 -7 -4 -2.5 -1.7 -1 -.5 0 .5 1 1.7 2.5 4 7 12 19 45"
 FOCUS_VALUES = "-90 -45 0 45 90"
 DATA_SIZE = 2 ** 17
+PREDICT_TIMEOUT_SEC = 0.12
+MAX_PREDICT_TIMEOUT_STEPS = 4
+AI_RECOVERY_STEPS = 18
 
 
 def _to_float_list(values):
@@ -54,6 +57,10 @@ def as_vector(value, size):
     out = np.zeros(size, dtype=np.float32)
     out[:arr.size] = arr
     return out
+
+
+def clip(value, low, high):
+    return max(low, min(high, value))
 
 
 def build_observation(raw_obs):
@@ -107,88 +114,167 @@ def build_observation(raw_obs):
     return obs.astype(np.float32)
 
 
-def safe_action(action, raw_obs):
-    act = np.asarray(action, dtype=np.float32).reshape(-1)
-    steer = float(np.clip(act[0], -1.0, 1.0))
-    throttle = float(np.clip((act[1] + 1.0) / 2.0, 0.0, 1.0))
+class DriveGuard:
+    def __init__(self):
+        self.mode = "AI"
+        self.predict_timeout_steps = 0
+        self.ai_recovery_steps = 0
+        self.prev_steer = 0.0
 
-    track = as_vector(raw_obs.get("track", []), 19)
-    front_dist = float(np.max(track[8:11]))
-    abs_angle = abs(float(raw_obs.get("angle", 0.0)))
-    track_pos_signed = float(raw_obs.get("trackPos", 0.0))
-    track_pos = abs(track_pos_signed)
-    speed = float(raw_obs.get("speedX", 0.0))
-    left_open = float(np.mean(track[:5]))
-    right_open = float(np.mean(track[14:]))
-    curve_asym = abs(left_open - right_open) / 70.0
-    curve_entry = max(0.0, (52.0 - front_dist) / 52.0)
-    heading_risk = abs_angle / 0.45
-    entry_bias = abs(float(np.mean(track[:3])) - float(np.mean(track[16:]))) / 75.0
+    def _set_mode(self, new_mode, reason):
+        if self.mode != new_mode:
+            print("Mode switch:", self.mode, "->", new_mode, "|", reason)
+            self.mode = new_mode
 
-    curve_risk = float(
-        np.clip(0.85 * curve_asym + 1.40 * curve_entry + 0.75 * heading_risk + 0.50 * entry_bias, 0.0, 2.4)
-    )
-    straightness = float(
-        np.clip(1.0 - 0.75 * curve_asym - 1.00 * curve_entry - 0.65 * heading_risk, 0.0, 1.0)
-    )
+    def _auto_gear(self, speed):
+        if speed < 38.0:
+            return 1
+        if speed < 70.0:
+            return 2
+        if speed < 102.0:
+            return 3
+        if speed < 135.0:
+            return 4
+        if speed < 170.0:
+            return 5
+        return 6
 
-    throttle_cap = float(np.clip(1.0 - (0.90 * curve_risk), 0.02, 0.92))
-    throttle = min(throttle, throttle_cap)
+    def _deterministic_action(self, raw_obs):
+        track = as_vector(raw_obs.get("track", []), 19)
+        speed = float(raw_obs.get("speedX", 0.0))
+        angle = float(raw_obs.get("angle", 0.0))
+        track_pos = float(raw_obs.get("trackPos", 0.0))
+        front_dist = float(np.max(track[8:11]))
 
-    safe_speed_local = min(175.0, np.sqrt(max(front_dist, 1.0)) * 15.5)
-    if curve_risk > 0.25 and speed > safe_speed_local:
-        throttle = min(throttle, max(0.0, 0.18 - 0.009 * (speed - safe_speed_local)))
+        steer = clip((angle * 0.95) - (track_pos * 0.85), -1.0, 1.0)
+        steer = clip((0.78 * self.prev_steer) + (0.22 * steer), -1.0, 1.0)
 
-    max_steer_delta = 0.32 - (0.22 * straightness)
-    steer = float(np.clip(steer, -1.0, 1.0))
-    steer = float(np.clip(steer, steer - max_steer_delta, steer + max_steer_delta))
-    if straightness > 0.72 and track_pos < 0.58 and abs_angle < 0.27:
-        steer = float(np.clip((0.90 * 0.0) + (0.10 * steer), -0.28, 0.28))
-    elif straightness > 0.55:
-        steer = float(np.clip((0.84 * 0.0) + (0.16 * steer), -0.36, 0.36))
+        safe_speed = min(165.0, np.sqrt(max(front_dist, 1.0)) * 15.5)
+        throttle = 0.34
+        brake = 0.0
 
-    if track_pos > 0.78 and abs_angle < 0.20:
-        throttle = min(throttle, 0.32)
-    if track_pos_signed > 0.78 and steer > 0.0:
-        steer *= 0.55
-    elif track_pos_signed < -0.78 and steer < 0.0:
-        steer *= 0.55
-    if speed > 85.0 and straightness > 0.55:
-        steer *= 0.75
+        if speed > safe_speed:
+            throttle = 0.0
+            brake = clip((speed - safe_speed) / 28.0, 0.0, 1.0)
+        elif speed < safe_speed * 0.9:
+            throttle = 0.46
 
-    if straightness > 0.88 and track_pos < 0.32 and abs_angle < 0.10 and speed < 110.0:
-        throttle = max(throttle, 0.52)
-    elif straightness > 0.72 and track_pos < 0.50 and abs_angle < 0.18 and speed < 100.0:
-        throttle = max(throttle, 0.40)
+        if abs(track_pos) > 0.90:
+            throttle = min(throttle, 0.24)
 
-    if curve_risk > 0.70:
-        throttle = min(throttle, 0.18)
-    if curve_risk > 0.95:
-        throttle = min(throttle, 0.08)
+        self.prev_steer = steer
+        return steer, throttle, brake, self._auto_gear(speed)
 
-    if speed < 10.0 and curve_risk < 0.40 and track_pos < 0.50:
-        throttle = max(throttle, 0.32)
+    def _safe_ai_action(self, action, raw_obs):
+        act = np.asarray(action, dtype=np.float32).reshape(-1)
+        steer = float(np.clip(act[0], -1.0, 1.0))
+        throttle = float(np.clip((act[1] + 1.0) / 2.0, 0.0, 1.0))
 
-    brake = 0.0
-    safe_speed = min(185.0, np.sqrt(max(front_dist, 1.0)) * 16.0)
-    if speed > safe_speed:
-        brake = min(1.0, (speed - safe_speed) / 35.0)
-        throttle = min(throttle, 0.2)
+        track = as_vector(raw_obs.get("track", []), 19)
+        front_dist = float(np.max(track[8:11]))
+        abs_angle = abs(float(raw_obs.get("angle", 0.0)))
+        track_pos_signed = float(raw_obs.get("trackPos", 0.0))
+        track_pos = abs(track_pos_signed)
+        speed = float(raw_obs.get("speedX", 0.0))
+        left_open = float(np.mean(track[:5]))
+        right_open = float(np.mean(track[14:]))
+        curve_asym = abs(left_open - right_open) / 70.0
+        curve_entry = max(0.0, (52.0 - front_dist) / 52.0)
+        heading_risk = abs_angle / 0.45
+        entry_bias = abs(float(np.mean(track[:3])) - float(np.mean(track[16:]))) / 75.0
 
-    if speed < 38.0:
-        gear = 1
-    elif speed < 70.0:
-        gear = 2
-    elif speed < 102.0:
-        gear = 3
-    elif speed < 135.0:
-        gear = 4
-    elif speed < 170.0:
-        gear = 5
-    else:
-        gear = 6
+        curve_risk = float(
+            np.clip(0.85 * curve_asym + 1.40 * curve_entry + 0.75 * heading_risk + 0.50 * entry_bias, 0.0, 2.4)
+        )
+        straightness = float(
+            np.clip(1.0 - 0.75 * curve_asym - 1.00 * curve_entry - 0.65 * heading_risk, 0.0, 1.0)
+        )
 
-    return steer, throttle, brake, gear
+        throttle_cap = float(np.clip(1.0 - (0.90 * curve_risk), 0.02, 0.92))
+        throttle = min(throttle, throttle_cap)
+
+        safe_speed_local = min(175.0, np.sqrt(max(front_dist, 1.0)) * 15.5)
+        if curve_risk > 0.25 and speed > safe_speed_local:
+            throttle = min(throttle, max(0.0, 0.18 - 0.009 * (speed - safe_speed_local)))
+
+        max_steer_delta = 0.32 - (0.22 * straightness)
+        steer = clip(steer, self.prev_steer - max_steer_delta, self.prev_steer + max_steer_delta)
+        if straightness > 0.72 and track_pos < 0.58 and abs_angle < 0.27:
+            steer = clip((0.90 * self.prev_steer) + (0.10 * steer), -0.28, 0.28)
+        elif straightness > 0.55:
+            steer = clip((0.84 * self.prev_steer) + (0.16 * steer), -0.36, 0.36)
+
+        if track_pos > 0.78 and abs_angle < 0.20:
+            throttle = min(throttle, 0.32)
+        if track_pos_signed > 0.78 and steer > 0.0:
+            steer *= 0.55
+        elif track_pos_signed < -0.78 and steer < 0.0:
+            steer *= 0.55
+        if speed > 85.0 and straightness > 0.55:
+            steer *= 0.75
+
+        if straightness > 0.88 and track_pos < 0.32 and abs_angle < 0.10 and speed < 110.0:
+            throttle = max(throttle, 0.52)
+        elif straightness > 0.72 and track_pos < 0.50 and abs_angle < 0.18 and speed < 100.0:
+            throttle = max(throttle, 0.40)
+
+        if curve_risk > 0.70:
+            throttle = min(throttle, 0.18)
+        if curve_risk > 0.95:
+            throttle = min(throttle, 0.08)
+
+        if speed < 10.0 and curve_risk < 0.40 and track_pos < 0.50:
+            throttle = max(throttle, 0.32)
+
+        brake = 0.0
+        safe_speed = min(185.0, np.sqrt(max(front_dist, 1.0)) * 16.0)
+        if speed > safe_speed:
+            brake = min(1.0, (speed - safe_speed) / 35.0)
+            throttle = min(throttle, 0.2)
+
+        self.prev_steer = steer
+        return steer, throttle, brake, self._auto_gear(speed)
+
+    def choose_action(self, model, obs, raw_obs):
+        track_pos = abs(float(raw_obs.get("trackPos", 0.0)))
+        off_track = track_pos > 1.0
+
+        action = None
+        predict_ok = False
+        t0 = time.time()
+        try:
+            action, _ = model.predict(obs, deterministic=True)
+            predict_ok = True
+        except Exception:
+            predict_ok = False
+        elapsed = time.time() - t0
+
+        if (not predict_ok) or (elapsed > PREDICT_TIMEOUT_SEC):
+            self.predict_timeout_steps += 1
+        else:
+            self.predict_timeout_steps = 0
+
+        if off_track:
+            self._set_mode("DET", "off-track recovery")
+            self.ai_recovery_steps = 0
+        elif self.predict_timeout_steps >= MAX_PREDICT_TIMEOUT_STEPS:
+            self._set_mode("DET", "AI output timeout")
+            self.ai_recovery_steps = 0
+
+        if self.mode == "AI" and predict_ok:
+            return self._safe_ai_action(action, raw_obs)
+
+        det_action = self._deterministic_action(raw_obs)
+
+        if predict_ok and self.predict_timeout_steps == 0 and track_pos < 0.75 and abs(float(raw_obs.get("angle", 0.0))) < 0.35:
+            self.ai_recovery_steps += 1
+            if self.ai_recovery_steps >= AI_RECOVERY_STEPS:
+                self._set_mode("AI", "recovered")
+                self.ai_recovery_steps = 0
+        else:
+            self.ai_recovery_steps = 0
+
+        return det_action
 
 
 def action_message(steer, accel, brake, gear):
@@ -217,6 +303,7 @@ def connect_client(sock):
 if __name__ == "__main__":
     print("Loading model:", MODEL_PATH)
     model = TD3.load(MODEL_PATH)
+    drive_guard = DriveGuard()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(SOCKET_TIMEOUT_SEC)
@@ -245,8 +332,7 @@ if __name__ == "__main__":
 
             state = parse_server_state(text)
             obs = build_observation(state)
-            action, _ = model.predict(obs, deterministic=True)
-            steer, accel, brake, gear = safe_action(action, state)
+            steer, accel, brake, gear = drive_guard.choose_action(model, obs, state)
 
             msg = action_message(steer, accel, brake, gear)
             sock.sendto(msg.encode("utf-8"), (HOST, PORT))
