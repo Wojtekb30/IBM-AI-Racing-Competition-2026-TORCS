@@ -1,3 +1,27 @@
+# How to start our car AI agent
+
+Please install pip packages listed in ```requirements.txt```, then run ```RunProgram.py``` script.
+
+The file ```car1-trb1.rgb``` is an custom appearance for our car.
+
+# Our approach
+
+Our team: WIPy_z_Polsl
+
+People:
+- Wojciech B
+- P
+
+We trained an TD3 RL neural network agent to drive the car. We trained it in such order:
+1. Pre-train to finish the Corkscrew circuit (max speed locked to ~85).
+2. Fine-tune to drive in a stable way (without random turning, max speed locked to ~85).
+3. Fine-tune to teach it speed control (full speed unlocked).
+4. Fine-tune to learn again how to finish the whole circuit.
+
+The inference script also has a deterministic safeguard system. If the car leaves the road or TD3 stops providing steering data, a deterministic steering algorithm takes control until the car is on the road again and TD3 resumes it.
+
+---
+
 # Gym-TORCS
 
 Gym-TORCS is the reinforcement learning (RL) environment in TORCS domain with OpenAI-gym-like interface.
