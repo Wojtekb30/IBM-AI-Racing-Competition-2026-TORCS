@@ -2,12 +2,13 @@ import socket
 import time
 import numpy as np
 from stable_baselines3 import TD3
-
+print("Autorzy | Authors: Wojciech B, Patryk N")
+print("Druzyna | Team: WIPy_z_Polsl")
 
 HOST = "localhost"
 PORT = 3001
 CLIENT_ID = "SCR"
-MODEL_PATH = "td3_torcs_trackaware_v1"
+MODEL_PATH = "td3_torcs_centerfinish_v2"
 SOCKET_TIMEOUT_SEC = 1.0
 
 TRACK_ANGLES = "-45 -19 -12 -7 -4 -2.5 -1.7 -1 -.5 0 .5 1 1.7 2.5 4 7 12 19 45"
@@ -114,28 +115,86 @@ def safe_action(action, raw_obs):
     track = as_vector(raw_obs.get("track", []), 19)
     front_dist = float(np.max(track[8:11]))
     abs_angle = abs(float(raw_obs.get("angle", 0.0)))
+    track_pos_signed = float(raw_obs.get("trackPos", 0.0))
+    track_pos = abs(track_pos_signed)
     speed = float(raw_obs.get("speedX", 0.0))
+    left_open = float(np.mean(track[:5]))
+    right_open = float(np.mean(track[14:]))
+    curve_asym = abs(left_open - right_open) / 70.0
+    curve_entry = max(0.0, (52.0 - front_dist) / 52.0)
+    heading_risk = abs_angle / 0.45
+    entry_bias = abs(float(np.mean(track[:3])) - float(np.mean(track[16:]))) / 75.0
 
-    danger = min(1.0, (abs_angle / 0.70) + max(0.0, (30.0 - front_dist) / 30.0))
-    throttle_cap = max(0.15, 1.0 - (0.75 * danger))
+    curve_risk = float(
+        np.clip(0.85 * curve_asym + 1.40 * curve_entry + 0.75 * heading_risk + 0.50 * entry_bias, 0.0, 2.4)
+    )
+    straightness = float(
+        np.clip(1.0 - 0.75 * curve_asym - 1.00 * curve_entry - 0.65 * heading_risk, 0.0, 1.0)
+    )
+
+    throttle_cap = float(np.clip(1.0 - (0.90 * curve_risk), 0.02, 0.92))
     throttle = min(throttle, throttle_cap)
 
-    if speed < 5.0 and front_dist > 20.0:
-        throttle = max(throttle, 0.35)
+    safe_speed_local = min(175.0, np.sqrt(max(front_dist, 1.0)) * 15.5)
+    if curve_risk > 0.25 and speed > safe_speed_local:
+        throttle = min(throttle, max(0.0, 0.18 - 0.009 * (speed - safe_speed_local)))
+
+    max_steer_delta = 0.32 - (0.22 * straightness)
+    steer = float(np.clip(steer, -1.0, 1.0))
+    steer = float(np.clip(steer, steer - max_steer_delta, steer + max_steer_delta))
+    if straightness > 0.72 and track_pos < 0.58 and abs_angle < 0.27:
+        steer = float(np.clip((0.90 * 0.0) + (0.10 * steer), -0.28, 0.28))
+    elif straightness > 0.55:
+        steer = float(np.clip((0.84 * 0.0) + (0.16 * steer), -0.36, 0.36))
+
+    if track_pos > 0.78 and abs_angle < 0.20:
+        throttle = min(throttle, 0.32)
+    if track_pos_signed > 0.78 and steer > 0.0:
+        steer *= 0.55
+    elif track_pos_signed < -0.78 and steer < 0.0:
+        steer *= 0.55
+    if speed > 85.0 and straightness > 0.55:
+        steer *= 0.75
+
+    if straightness > 0.88 and track_pos < 0.32 and abs_angle < 0.10 and speed < 110.0:
+        throttle = max(throttle, 0.52)
+    elif straightness > 0.72 and track_pos < 0.50 and abs_angle < 0.18 and speed < 100.0:
+        throttle = max(throttle, 0.40)
+
+    if curve_risk > 0.70:
+        throttle = min(throttle, 0.18)
+    if curve_risk > 0.95:
+        throttle = min(throttle, 0.08)
+
+    if speed < 10.0 and curve_risk < 0.40 and track_pos < 0.50:
+        throttle = max(throttle, 0.32)
 
     brake = 0.0
-    safe_speed = min(220.0, np.sqrt(max(front_dist, 1.0)) * 22.0)
+    safe_speed = min(185.0, np.sqrt(max(front_dist, 1.0)) * 16.0)
     if speed > safe_speed:
         brake = min(1.0, (speed - safe_speed) / 35.0)
         throttle = min(throttle, 0.2)
 
-    return steer, throttle, brake
+    if speed < 38.0:
+        gear = 1
+    elif speed < 70.0:
+        gear = 2
+    elif speed < 102.0:
+        gear = 3
+    elif speed < 135.0:
+        gear = 4
+    elif speed < 170.0:
+        gear = 5
+    else:
+        gear = 6
+
+    return steer, throttle, brake, gear
 
 
-def action_message(steer, accel, brake):
+def action_message(steer, accel, brake, gear):
     return (
-        "(accel %.3f)(brake %.3f)(gear 1)(steer %.3f)(clutch 0)(focus %s)(meta 0)"
-        % (accel, brake, steer, FOCUS_VALUES)
+        "(accel %.3f)(brake %.3f)(gear %d)(steer %.3f)(clutch 0)(focus %s)(meta 0)"
+        % (accel, brake, gear, steer, FOCUS_VALUES)
     )
 
 
@@ -187,9 +246,9 @@ if __name__ == "__main__":
             state = parse_server_state(text)
             obs = build_observation(state)
             action, _ = model.predict(obs, deterministic=True)
-            steer, accel, brake = safe_action(action, state)
+            steer, accel, brake, gear = safe_action(action, state)
 
-            msg = action_message(steer, accel, brake)
+            msg = action_message(steer, accel, brake, gear)
             sock.sendto(msg.encode("utf-8"), (HOST, PORT))
     except KeyboardInterrupt:
         print("Stopped by user.")
